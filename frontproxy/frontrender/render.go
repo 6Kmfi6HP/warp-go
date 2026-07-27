@@ -79,6 +79,54 @@ var corsAllowOrigins = []string{
 	"http://localhost:9090",
 }
 
+// TypeGuardTypes is the welded-shut, non-configurable list of mihomo proxy
+// types that frontrender's per-country proxy-groups exclude from their candidate
+// pool via `exclude-type`. It is a package-level const (not a var, not an option
+// string) so no code path can mutate the set at run time —— the "TypeGuardTypes
+// 焊死不可配" guard from #12 body's 8 anti-corruption guards.
+//
+// The five literals are not invented here; they are the exact return values of
+// mihomo's AdapterType.String() (metacubex/mihomo@v1.19.29
+// constant/adapters.go:178-188):
+//
+//	case Direct:       return "Direct"
+//	case Reject:       return "Reject"
+//	case RejectDrop:   return "RejectDrop"
+//	case Compatible:   return "Compatible"
+//	case Pass:         return "Pass"
+//
+// These five are precisely the types whose silent presence in a url-test
+// group's candidate pool is the PoC-3 root cause: mihomo pre-seeds DIRECT/REJECT
+// into the global proxy list (config.go proxyList=append("DIRECT","REJECT")) and
+// defaults an empty `empty-fallback` to COMPATIBLE (adapter/outboundgroup/
+// parser.go:72-74), so a url-test group that draws the full pool can cold-select
+// back to a direct/compatible proxy. `exclude-type: <TypeGuardTypes>` makes a
+// per-country group drop exactly these types (groupbase.go:60-61 splits on "|"
+// and groupbase.go:217 matches via strings.EqualFold), breaking the cold-select-
+// to-direct chain.
+//
+// The "|" separator is mandated by mihomo: adapter/outboundgroup/groupbase.go:61
+// does `strings.Split(opt.ExcludeType, "|")`. Any other separator (e.g. ",")
+// would make mihomo treat the whole string as one type name that EqualFold never
+// matches, silently voiding the guard. TypeGuardTypes is tested for set equality
+// against an independent true-source literal in render_test.go
+// (TestRender_TypeGuardTypesWelded) so a typo, a missing type, a duplicate,
+// or a swapped separator brings the test down rather than shipping a void
+// guard.
+//
+// Spec deviation note (recorded for future reviewers / spec authors): #12 body
+// asks renderModel to also carry a `PerCountryDefaultSelectedTemplate="{{.ISO}}-node-1"`
+// field. That field path is **not viable under text/template**: the engine does not
+// re-expand `{{...}}` actions embedded inside a field's string value, and renderModel
+// is per-call (not per-country), so a field value cannot expand the per-country ISO.
+// Inlining `default-selected: "{{.ISO}}-node-1"` in yamlTemplate — where it sits
+// inside the per-country `{{range .Countries}}` and the engine expands `{{.ISO}}`
+// against the current CountrySpec — is the only viable form. The pinning intent
+// (each country's select group cold-starts on `<ISO>-node-1`) is fully met by the
+// inline; the renderModel field is intentionally omitted as an engine-limit
+// deviation, not a missed requirement.
+const TypeGuardTypes = "Direct|Compatible|Reject|Pass|RejectDrop"
+
 // The controllerSecret passed to Render is embedded verbatim into the secret
 // scalar field — frontrender never generates or persists it. Render refuses an
 // empty or sub-32-char secret: a weak secret here is a safety red line, not a
@@ -105,6 +153,20 @@ type renderModel struct {
 	ExternalUIPath   string // P3：external-ui 磁盘路径；空 = 未启用 P3，整段不渲染
 	ExternalUIURL    string // P3：恒空字面，擦掉 mihomo gh-pages.zip 默认
 	ExternalUIName   string // P3：恒空字面，防 NewUiUpdater serve 路径错位
+	// TypeGuardTypes is the const TypeGuardTypes bridged onto the model so the
+	// text/template can render it as {{.TypeGuardTypes}}. It is恒等于 the package
+	// const (set unconditionally in Render); no option can change it. text/template
+	// cannot reach a package-level const directly — its data root is renderModel —
+	// so this field is the mandatory bridge, not a configurable knob.
+	TypeGuardTypes string
+	// TypeGuardExclude gates the per-country double-group (select + url-test) that
+	// carries the exclude-type guard. It is set true unconditionally in Render
+	// (default ON) and only ever set true by WithTypeGuardExclude — there is no
+	// option to set it false, so the template's {{if .TypeGuardExclude}} is always
+	// true in practice. The field exists so the option has a real model path (it
+	// is auditable / greppable), and so a future mistake that drops the default
+	// would surface as a red test rather than a silently half-rendered group.
+	TypeGuardExclude bool
 }
 
 // yamlTemplate is the single source of truth for the rendered output shape.
@@ -199,13 +261,31 @@ proxy-providers:
 {{- end}}
 
 # ---- groups -----------------------------------------------------------
-# 每国一个 select group，use 自己的 country-filtered provider。
+# 每国双组（PoC-3 #12 切片 (d) TypeGuard）：select 组 + url-test 组。
+# 双组都带 exclude-type: <TypeGuardTypes>，把 mihomo 五型（Direct/Compatible/
+# Reject/Pass/RejectDrop）从本组候选池剔出（mihomo groupbase.go split "|" + EqualFold），
+# 断"冷选回直连" root cause（config.go proxyList 预塞 DIRECT/REJECT + parser.go
+# EmptyFallback 默认 COMPATIBLE）。select 组额外 default-selected 钉国冷启默认节点。
+# 绝不渲染 include-all-proxies（mihomo parser.go:95 会把 AllProxies 整池含 DIRECT 入组）。
+# include-all-proxies 是红线：frontrender 永不渲染该 key 的任何形态。
 proxy-groups:
+{{- if .TypeGuardExclude}}
 {{- range .Countries}}
   - name: group-{{.ISO}}
     type: select
+    default-selected: "{{.ISO}}-node-1"
+    exclude-type: {{$.TypeGuardTypes}}
     use:
       - provider-{{.ISO}}
+  - name: ut-{{.ISO}}
+    type: url-test
+    exclude-type: {{$.TypeGuardTypes}}
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    lazy: true
+    use:
+      - provider-{{.ISO}}
+{{- end}}
 {{- end}}
 
 # rules：默认全走 DIRECT，frontrender 不负责路由策略（由后续票 P1-B/P1-D 接）。
@@ -249,6 +329,25 @@ func WithExternalUIPath(path string) Option {
 		if path != "" {
 			m.ExternalUIPath = path
 		}
+	}
+}
+
+// WithTypeGuardExclude is the opt-in declaration for the PoC-3 TypeGuard
+// (#12 切片 (d)). It pins m.TypeGuardExclude = true. It is the *only* option
+// touching TypeGuard and it can only set the field true — there is deliberately
+// no WithTypeGuardExcludeDisabled, no WithTypeGuardTypes(override), no knob to
+// change exclude-type's value. That asymmetry is the "默认 ON、不暴露关闭口子"
+// weld from #12 body's 8 anti-corruption guards: the guard is default-on (Render
+// sets TypeGuardExclude: true unconditionally) and the only opt-in path keeps it
+// on, so no code path can ship a per-country proxy-group without exclude-type.
+//
+// Calling it is a declaration of intent (auditable / greppable at the call site)
+// rather than a behavior toggle: with or without it, the rendered YAML has the
+// double-group + exclude-type. Tests pin both paths (default + WithTypeGuardExclude)
+// to the same exclude-type value in TestRender_TypeGuardExcludeTypeRenderedAndImmuneToOption.
+func WithTypeGuardExclude() Option {
+	return func(m *renderModel) {
+		m.TypeGuardExclude = true
 	}
 }
 
@@ -296,6 +395,12 @@ func Render(countries []CountrySpec, providerURL string, controllerSecret string
 		ControllerSecret: controllerSecret,
 		PrivateCIDRs:     privateCIDRs,
 		CorsAllowOrigins: corsAllowOrigins,
+		// PoC-3 切片 (d) TypeGuard 默认 ON（#12 body "默认 ON、不暴露关闭口子"）：
+		// TypeGuardTypes 恒等于包级 const（模板 {{.TypeGuardTypes}} 访问桥），
+		// TypeGuardExclude 恒 true（template {{if .TypeGuardExclude}} 永真段恒渲染双组）。
+		// 无 option 可改这两者——WithTypeGuardExclude() 只置 true。
+		TypeGuardTypes:   TypeGuardTypes,
+		TypeGuardExclude: true,
 	}
 	for _, opt := range opts {
 		if opt != nil {

@@ -49,6 +49,15 @@ func wantPortByISO() map[string]int {
 	}
 }
 
+// sevenISOs 是 7 国 ISO 清单的单一定义点，让所有逐国 range 的测试共享同一份国家集，
+// 加国时一处改而非每测改（DRY）。与 sevenCountries()（带端口/auth 的结构表）+ wantPortByISO()
+// （端口金标准）并列；本 helper 只给"逐国 ISO 迭代"的测试用（不含端口/auth 断言）。
+// P1-C 时期的旧测（render_test.go 早期 slice）就地用字面 7-ISO range，未统一到此 helper——
+// 那 4 处属历史遗留，本切片 (d) 的新增 4 处统一走 sevenISOs()，旧处留待 future cleanup。
+func sevenISOs() []string {
+	return []string{"JP", "KR", "US", "VN", "RU", "ID", "TH"}
+}
+
 // constProviderURL 是 vpngate-meridian gh-pages 的 mihomo_tested_openvpn.yaml 远程
 // HTTP provider 源（#1 spec user story 19）。固定下来让 provider 段断言可复现。
 const constProviderURL = "https://vpngate-meridian.github.io/mihomo_tested_openvpn.yaml"
@@ -737,4 +746,235 @@ func hasPrivateCIDR(seg string) bool {
 		}
 	}
 	return false
+}
+
+// --- #12 切片 (d) frontrender TypeGuard -------------------------------------
+// PoC-3 机制层切片 (d)：把 mihomo "冷选回直连" root cause（config.go proxyList 预塞
+// DIRECT/REJECT + parser.go EmptyFallback 默认 COMPATIBLE）用一道"按 proxy type 剔池"
+// 的焊死防线堵掉。本块是切片 (d) 的单测，seam = Render 出 YAML + TypeGuardTypes 公共符号。
+// mihomo 行为真源（已 grep metacubex/mihomo@v1.19.29 module cache 钉死）：
+//   - constant/adapters.go:178-188 AdapterType.String() 五个返回值 "Direct"/"Reject"/
+//     "RejectDrop"/"Compatible"/"Pass" —— TypeGuardTypes 五型字面真源
+//   - adapter/outboundgroup/parser.go:41 ExcludeType group:"exclude-type,omitempty" +
+//     groupbase.go:60-61 strings.Split(opt.ExcludeType,"|") + EqualFold —— "|" 分隔真源
+//   - adapter/outboundgroup/selector.go:12 DefaultSelected group:"default-selected,omitempty"
+//   - adapter/outboundgroup/parser.go:72-74 EmptyFallback 默认 "COMPATIBLE" —— root cause 链
+//   - adapter/outboundgroup/parser.go:95 include-all-proxies → AllProxies 整池入组 —— 红线
+//
+// 红线（#12 body 8 反腐守卫摘）：frontrender 零 mihomo import（纯 text/template）·
+// TypeGuardTypes 焊死不可配 · 不渲染 include-all-proxies。
+
+// wantGuardTypes 是从 mihomo constant/adapters.go:178-188 摘出的五个 Type().String()
+// 返回值，作为 TypeGuardTypes 字面的**独立真源**（不引用 TypeGuardTypes 自身，避免
+// tautological 自比）。TypeGuardTypes 必须是这五型用 "|" 分隔的集合，顺序无关——
+// mihomo groupbase.go:217 用 strings.EqualFold 逐项匹配，对顺序与大小写不敏感。
+var wantGuardTypes = []string{"Direct", "Compatible", "Reject", "Pass", "RejectDrop"}
+
+// TestRender_TypeGuardTypesWelded 验证 TypeGuardTypes 是 mihomo 五型 proxy type
+// 字面的精确集合，用 "|" 分隔。真源独立（wantGuardTypes 从 mihomo 源码摘出），所以
+// 若有人误写六型、漏一型、换分隔符（如换成 ","）、或拼错大小写非 EqualFold 容忍范围，
+// 这个测会红。它是切片 (d) "五型字面焊死" 的行为守门——Go 运行期测不了 "是 const 而非 var"，
+// 那一层焊死留给 code-review 两轴审；本测只测可观察的字面正确性。
+//
+// seam：TypeGuardTypes 公共符号（包级 const 是 frontrender 对外契约的一部分，选组
+// exclude-type 渲染值的真理来源）。
+func TestRender_TypeGuardTypesWelded(t *testing.T) {
+	got := strings.Split(TypeGuardTypes, "|")
+	if len(got) != len(wantGuardTypes) {
+		t.Fatalf("TypeGuardTypes 分隔后 %d 项，want %d 项（got=%q want=%q）",
+			len(got), len(wantGuardTypes), got, wantGuardTypes)
+	}
+	// 集合相等（顺序无关，对齐 mihomo EqualFold 的顺序无关语义）。
+	gotSet := make(map[string]bool, len(got))
+	for _, g := range got {
+		gotSet[g] = true
+	}
+	for _, w := range wantGuardTypes {
+		if !gotSet[w] {
+			t.Errorf("TypeGuardTypes 缺 mihomo proxy type %q（got=%q）", w, got)
+		}
+	}
+	if len(gotSet) != len(wantGuardTypes) {
+		t.Errorf("TypeGuardTypes 有重复项（got=%q）", got)
+	}
+	// 分隔符必须是 "|" —— mihomo groupbase.go:61 strings.Split(opt.ExcludeType, "|")。
+	// 换成 "," 会让 mihomo 把整个串当成单个 type 名，EqualFold 永不命中 → exclude-type 空设。
+	if !strings.Contains(TypeGuardTypes, "|") {
+		t.Errorf("TypeGuardTypes 必须用 | 分隔（mihomo Split 分隔符），got %q", TypeGuardTypes)
+	}
+}
+
+// TestRender_PerCountrySelectHasDefaultSelectedAndExcludeType 验证每国 select 组
+// （group-<ISO>）含 default-selected + exclude-type 两字段。default-selected 是 mihomo
+// select 组专用字段（selector.go:12 DefaultSelected group:"default-selected,omitempty"），
+// 钉住该国冷启默认节点（<ISO>-node-1）防漂；exclude-type 用 TypeGuardTypes 把五型从本组
+// 候选池剔出（groupbase.go:60-61 split "|" + :217 EqualFold），断"冷选回直连" root cause。
+//
+// 逐国切分 group-<ISO> 段（entryBlock）后断言：①段含 "default-selected:" 字段标识；
+// ②default-selected 行的值含 "<ISO>-node-1"（钉国锚点）；③段含 "exclude-type:" 字段标识。
+// 不断言 exclude-type 的值字面——值正确性由 TestRender_TypeGuardExcludeTypeRenderedAndImmuneToOption
+// 锁定（值恒等于 TypeGuardTypes const）；本测只锁"字段存在 + 钉国值"。
+//
+// seam：Render 出 YAML（默认行为，无 option —— TypeGuard 默认 ON，见 #12 body）。
+func TestRender_PerCountrySelectHasDefaultSelectedAndExcludeType(t *testing.T) {
+	yaml := renderOK(t)
+	for _, iso := range sevenISOs() {
+		seg, ok := entryBlock(yaml, "group-"+iso)
+		if !ok {
+			t.Errorf("找不到 %s select 组 entry（group-%s）", iso, iso)
+			continue
+		}
+		if !strings.Contains(seg, "default-selected:") {
+			t.Errorf("%s select 组缺 default-selected（冷启默认节点未钉国）", iso)
+		} else {
+			// default-selected 行的值必须含 <ISO>-node-1 —— 钉国锚点。
+			line := findLineWith([]byte(seg), "default-selected:")
+			val := strings.TrimSpace(strings.TrimPrefix(line, "default-selected:"))
+			val = strings.Trim(val, "\"'")
+			if !strings.Contains(val, iso+"-node-1") {
+				t.Errorf("%s select 组 default-selected 值 %q 不含 %s-node-1（钉国锚点漂）",
+					iso, val, iso)
+			}
+		}
+		if !strings.Contains(seg, "exclude-type:") {
+			t.Errorf("%s select 组缺 exclude-type（未剔五型 → 冷选回直连 root cause 未堵）", iso)
+		}
+		if !strings.Contains(seg, "type: select") {
+			t.Errorf("%s select 组缺 type: select（组类型错）", iso)
+		}
+	}
+}
+
+// TestRender_PerCountryUrlTestHasExcludeType 验证每国新增 url-test 组（ut-<ISO>）含
+// exclude-type + url + interval + lazy:true。url-test 组用 exclude-type 同样剔五型，
+// 与 select 组形成双组防线（任一组都不让 DIRECT/Compatible 静默入池）。url/interval/
+// lazy 是 mihomo url-test 探活三件套（parser.go GroupCommonOption group tag：
+// url/interval/lazy），lazy:true 防冷启即探活（冷启无 RTT 数据时 fast() 仅按池顺序选，
+// 正是冷选回直连的窗口——lazy 让探活延后到首请求，配合 exclude-type 把直连剔出池）。
+//
+// 逐国切分 ut-<ISO> 段后断言：①段含 "type: url-test"；②段含 "exclude-type:"；
+// ③段含 "url:"（探活 URL）；④段含 "interval:"（探活间隔）；⑤段含 "lazy: true"（延后探活）。
+//
+// seam：Render 出 YAML（默认行为，无 option）。
+func TestRender_PerCountryUrlTestHasExcludeType(t *testing.T) {
+	yaml := renderOK(t)
+	for _, iso := range sevenISOs() {
+		seg, ok := entryBlock(yaml, "ut-"+iso)
+		if !ok {
+			t.Errorf("找不到 %s url-test 组 entry（ut-%s）—— 未渲染每国 url-test 双组", iso, iso)
+			continue
+		}
+		if !strings.Contains(seg, "type: url-test") {
+			t.Errorf("%s url-test 组缺 type: url-test", iso)
+		}
+		if !strings.Contains(seg, "exclude-type:") {
+			t.Errorf("%s url-test 组缺 exclude-type（未剔五型 → 冷选回直连 root cause 未堵）", iso)
+		}
+		if !strings.Contains(seg, "url:") {
+			t.Errorf("%s url-test 组缺 url（探活 URL 未配）", iso)
+		}
+		if !strings.Contains(seg, "interval:") {
+			t.Errorf("%s url-test 组缺 interval（探活间隔未配）", iso)
+		}
+		if !strings.Contains(seg, "lazy: true") && !strings.Contains(seg, "lazy:true") {
+			t.Errorf("%s url-test 组缺 lazy: true（未延后探活 → 冷启即探活窗口漏）", iso)
+		}
+	}
+}
+
+// TestRender_NoIncludeAllProxies 验证渲染输出的 proxy-groups 段实质行绝不含
+// "include-all-proxies:" / "include-all:" key。这是 #12 body 8 反腐守卫之一：mihomo
+// parser.go:95 include-all-proxies=true 时把 AllProxies 整池 append 进组候选（AllProxies
+// 在 config.go:893 预塞了 DIRECT/REJECT），是冷选回直连的另一条入池口子。frontrender
+// 永不渲染该 key —— 即便有人误塞 include-all-proxies: false，也是个多余的、可能被后续
+// 手改翻成 true 的危险开关；正确形态是 proxy-groups 段实质行根本没有这个 key。
+//
+// 本测只扫 proxy-groups 段的**实质 map 键行**（跳过注释行）——因为 yamlTemplate 在该段
+// 顶部用注释解释了"为何禁 include-all-proxies"（含该字面，是好的工程实践：告诉 reviewer
+// 根因），粗粒度 bytes.Contains 全文扫会把注释字面误判为红线被破。真正的 seam 是"生产
+// 字段不含该 key"，断言收窄到非注释的 map 键行。
+//
+// seam：Render 出 YAML 的 proxy-groups 段实质行（默认行为）。
+func TestRender_NoIncludeAllProxies(t *testing.T) {
+	yaml := renderOK(t)
+	seg, ok := entryBlock(yaml, "proxy-groups:")
+	if !ok {
+		t.Fatal("找不到 proxy-groups 段——无法断言 include-all-proxies 红线")
+	}
+	for _, line := range strings.Split(seg, "\n") {
+		// 跳过注释行（含 # 开头的注释与行内注释前的实质 key 部分单独处理）。
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// 实质 map 键行：以 "include-all-proxies:" 或 "include-all:" 为 key。
+		// 列表项形态 "- include-all-proxies:..." 也 covered（TrimSpace 后仍可能含 "- "，单独查 key 子串）。
+		if strings.HasPrefix(trimmed, "include-all-proxies:") ||
+			strings.HasPrefix(trimmed, "include-all:") ||
+			strings.Contains(trimmed, " include-all-proxies:") ||
+			strings.Contains(trimmed, " include-all:") {
+			t.Errorf("proxy-groups 段含危险 key %q（mihomo AllProxies 整池入组 → DIRECT 静默进池 → 红线被破）", trimmed)
+		}
+	}
+}
+
+// TestRender_TypeGuardExcludeTypeRenderedAndImmuneToOption 验证 exclude-type 渲染且
+// 不可被 option 关闭。这是 "TypeGuard 默认 ON、不暴露关闭口子" 的行为焊测（#12 body）：
+// ①默认（无 option）渲染 exclude-type 且值等于 TypeGuardTypes const；②显式传 WithTypeGuardExclude
+// 仍渲染、值不变；③不存在任何 option 能让 exclude-type 消失或改值。
+//
+// 由于 frontrender 不暴露关闭 option（WithTypeGuardExclude 是唯一相关 option 且只置 true），
+// 本测的核心断言是"渲染值恒等于 const"——任何 code path 下 exclude-type 行的值都是
+// TypeGuardTypes。这把 const（TestRender_TypeGuardTypesWelded 验字面）与渲染（验落地）
+// 焊成同一道防线。
+//
+// seam：Render 出 YAML（默认 + 带 option 两条路径都验）。
+func TestRender_TypeGuardExcludeTypeRenderedAndImmuneToOption(t *testing.T) {
+	// 路径 1：默认无 option。
+	yamlDefault := renderOK(t)
+	// 路径 2：显式 WithTypeGuardExclude（即便存在也只置 true，不可关）。
+	outOpt, err := Render(sevenCountries(), constProviderURL, constControllerSecret, WithTypeGuardExclude())
+	if err != nil {
+		t.Fatalf("Render 带 WithTypeGuardExclude 返回错误：%v", err)
+	}
+	for _, yaml := range [][]byte{yamlDefault, outOpt} {
+		// 每国 select 组的 exclude-type 值必须等于 TypeGuardTypes const。
+		for _, iso := range sevenISOs() {
+			seg, ok := entryBlock(yaml, "group-"+iso)
+			if !ok {
+				t.Errorf("找不到 %s select 组 entry（group-%s）", iso, iso)
+				continue
+			}
+			line := findLineWith([]byte(seg), "exclude-type:")
+			if line == "" {
+				t.Errorf("%s select 组无 exclude-type 行（TypeGuard 未渲染）", iso)
+				continue
+			}
+			val := strings.TrimSpace(strings.TrimPrefix(line, "exclude-type:"))
+			val = strings.Trim(val, "\"'")
+			if val != TypeGuardTypes {
+				t.Errorf("%s select 组 exclude-type 值=%q，want const %q（值被改写 → TypeGuard 焊死被破）",
+					iso, val, TypeGuardTypes)
+			}
+		}
+		// 每国 url-test 组同理。
+		for _, iso := range sevenISOs() {
+			seg, ok := entryBlock(yaml, "ut-"+iso)
+			if !ok {
+				t.Errorf("找不到 %s url-test 组 entry（ut-%s）", iso, iso)
+				continue
+			}
+			line := findLineWith([]byte(seg), "exclude-type:")
+			if line == "" {
+				t.Errorf("%s url-test 组无 exclude-type 行（TypeGuard 未渲染）", iso)
+				continue
+			}
+			val := strings.TrimSpace(strings.TrimPrefix(line, "exclude-type:"))
+			val = strings.Trim(val, "\"'")
+			if val != TypeGuardTypes {
+				t.Errorf("%s url-test 组 exclude-type 值=%q，want const %q",
+					iso, val, TypeGuardTypes)
+			}
+		}
+	}
 }
