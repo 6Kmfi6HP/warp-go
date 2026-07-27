@@ -91,8 +91,15 @@ const connectExchangeTimeout = 15 * time.Second
 
 // connBundle groups everything owned by a single QUIC connection attempt so the
 // whole set can be torn down together on reconnect.
+//
+// udpConn is net.PacketConn rather than *net.UDPConn so the B-1 injection seam
+// can plug in any net.PacketConn the anti-corruption layer returns (decision-
+// dense point #7: quic-go's wrapConn accepts a non-OOBCapablePacketConn and
+// degrades to basicConn, buffer-tuning failure is a warning not an abort). The
+// direct-connect fallback still hands in a real *net.UDPConn — net.UDPConn
+// satisfies net.PacketConn, so bundle creation and close are unchanged there.
 type connBundle struct {
-	udpConn  *net.UDPConn
+	udpConn  net.PacketConn
 	qtr      *quic.Transport
 	quicConn *quic.Conn
 	h3Client *http3.ClientConn
@@ -158,6 +165,18 @@ type MasqueClient struct {
 	// singleflight for DNS: coalesce concurrent queries for the same host
 	dnsFlight   map[string]*dnsFlightResult
 	dnsFlightMu sync.Mutex
+
+	// resolver is the B-1 injection seam (ADR-0001). When non-nil, dialAddr
+	// obtains the UDP conn for the WARP QUIC/UDP datagrams by calling it instead
+	// of opening a plain net.ListenUDP. Returning (nil, nil) from the resolver
+	// falls back to net.ListenUDP, preserving the current direct-connect behavior
+	// — the roll-back anchor for B-1-PoC-2. Nil field here is equivalent to a
+	// resolver that always returns (nil, nil): the constructor defaults it.
+	//
+	// The returned net.PacketConn is read by dialAddr's own goroutine and never
+	// shared with the SOCKS5 listener — two goroutines on one fd steal each
+	// other's datagrams (prototype decision-dense point #1).
+	resolver PacketResolver
 }
 
 type dnsCacheEntry struct {
@@ -173,7 +192,27 @@ type dnsFlightResult struct {
 
 // NewMasqueClient establishes a QUIC/H3 connection to the WARP edge.
 // edgeAddrs are candidate host:port addresses tried in order.
+//
+// Behavior is the status-quo direct connect: the UDP underlay is a plain
+// net.ListenUDP in the edge's family. Callers that need the B-1 injection seam
+// (ADR-0001) should use NewMasqueClientWithResolver instead.
 func NewMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string) (*MasqueClient, error) {
+	return newMasqueClient(edgeAddrs, tlsConfig, token, nil)
+}
+
+// NewMasqueClientWithResolver establishes a QUIC/H3 connection like
+// NewMasqueClient but routes the UDP underlay through resolver. When resolver is
+// nil or returns (nil, nil) the dial falls back to a plain net.ListenUDP — the
+// zero-behavior-change roll-back anchor. A non-nil resolver error aborts the
+// dial so a refusal surfaces rather than silently falling through.
+func NewMasqueClientWithResolver(edgeAddrs []string, tlsConfig *tls.Config, token string, resolver PacketResolver) (*MasqueClient, error) {
+	return newMasqueClient(edgeAddrs, tlsConfig, token, resolver)
+}
+
+// newMasqueClient is the shared constructor; the two exported wrappers just pin
+// the presence of the resolver. Both keep the dial-at-construct behavior of the
+// original NewMasqueClient.
+func newMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string, resolver PacketResolver) (*MasqueClient, error) {
 	if len(edgeAddrs) == 0 {
 		return nil, errors.New("未提供任何边缘地址")
 	}
@@ -205,6 +244,7 @@ func NewMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string) (*
 		tlsConfig:  tlsConfig.Clone(),
 		quicConfig: quicConfig,
 		token:      token,
+		resolver:   resolver,
 		dnsCache:   make(map[string]dnsCacheEntry),
 		dnsFlight:  make(map[string]*dnsFlightResult),
 	}
@@ -266,14 +306,12 @@ func (c *MasqueClient) dialAddr(ctx context.Context, edgeAddr string) (*connBund
 		return nil, fmt.Errorf("解析边缘地址 %s 失败：%w", edgeAddr, err)
 	}
 
-	// Bind the local socket in the same address family as the edge.
-	listenAddr := &net.UDPAddr{IP: net.IPv4zero}
-	if udpAddr.IP.To4() == nil {
-		listenAddr = &net.UDPAddr{IP: net.IPv6zero}
-	}
-	udpConn, err := net.ListenUDP("udp", listenAddr)
+	// Obtain the UDP conn that carries the WARP QUIC/UDP datagrams. With no
+	// resolver this is the status-quo net.ListenUDP bound in the edge's family;
+	// with one it is whatever the anti-corruption layer returns (the B-1 seam).
+	udpConn, err := c.obtainUnderlayConn(edgeAddr, udpAddr)
 	if err != nil {
-		return nil, fmt.Errorf("监听 UDP 失败：%w", err)
+		return nil, err
 	}
 
 	// Dial through an explicit Transport so the source connection ID length can
@@ -326,6 +364,49 @@ func (c *MasqueClient) dialAddr(ctx context.Context, edgeAddr string) (*connBund
 		b.close("SETTINGS timeout")
 		return nil, errors.New("HTTP/3 初始化超时：未等到服务端 SETTINGS")
 	}
+}
+
+// obtainUnderlayConn returns the net.PacketConn that carries the WARP QUIC/UDP
+// datagrams to the edge for one dialAddr attempt.
+//
+// It implements the B-1 injection seam (ADR-0001) with the zero-behavior-change
+// fallback:
+//
+//   - c.resolver == nil: the direct-connect path. A net.ListenUDP is bound in the
+//     same address family as the edge — the exact lines that lived here before the
+//     seam. This is the roll-back anchor: B-1-PoC-2 failing on real nodes leaves
+//     warp-go working exactly as today via this branch.
+//   - c.resolver != nil: the resolver is consulted. (nil, nil) means "I decline;
+//     take the fallback" — identical to above. A non-nil net.PacketConn is used as
+//     provided (it is the OpenVPN/gVisor underlay); a non-nil error aborts the
+//     dial without ever binding, so a refusal surfaces instead of silently
+//     falling through to direct connect.
+//
+// The returned conn is owned by the caller's dial goroutine and is never shared
+// with the SOCKS5 listener — two goroutines on one fd steal each other's
+// datagrams (prototype decision-dense point #1).
+func (c *MasqueClient) obtainUnderlayConn(edgeAddr string, udpAddr *net.UDPAddr) (net.PacketConn, error) {
+	if c.resolver != nil {
+		conn, err := c.resolver(edgeAddr)
+		if err != nil {
+			return nil, fmt.Errorf("边缘注入解析器对 %s 拒绝：%w", edgeAddr, err)
+		}
+		if conn != nil {
+			return conn, nil
+		}
+		// (nil, nil) → fall through to the direct-connect bind below.
+	}
+
+	// Bind the local socket in the same address family as the edge.
+	listenAddr := &net.UDPAddr{IP: net.IPv4zero}
+	if udpAddr.IP.To4() == nil {
+		listenAddr = &net.UDPAddr{IP: net.IPv6zero}
+	}
+	udpConn, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("监听 UDP 失败：%w", err)
+	}
+	return udpConn, nil
 }
 
 func (c *MasqueClient) currentConnection() (*connBundle, error) {
