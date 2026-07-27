@@ -9,13 +9,11 @@ import (
 	"io/fs"
 	"log"
 	"net"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	"warp/internal/warpserver"
 	"warp/registration"
 	"warp/scanner"
 	"warp/tunnel"
@@ -38,7 +36,7 @@ func usage() {
   warp [选项]
 
 代理：
-  -l <host:port>   SOCKS5 监听地址（默认 :40000，同时接受 IPv4 与 IPv6 客户端）
+  -l <host:port>   SOCKS5 监听地址（默认 127.0.0.1:40000 仅绑回环；对外监听须配 -user/-pass 或前置 TLS 反代）
   -user <用户名>   SOCKS5 用户名；必须同时给出 -user 和 -pass 才启用认证
   -pass <密码>     SOCKS5 密码
   -ip <取值>       连接哪个边缘（默认 4）：
@@ -70,8 +68,7 @@ func usage() {
   warp -ip 6                              通过 IPv6 连接边缘
   warp -ip 162.159.198.2:4500             指定边缘地址与端口
   warp -ip example.com:443                通过域名连接自定义边缘
-  warp -l 127.0.0.1:1080                  只监听回环地址
-  warp -l 0.0.0.0:1080 -user u -pass s    对外提供服务并要求认证
+  warp -l 0.0.0.0:1080 -user u -pass s    对外提供服务并要求认证（非回环须配 -user/-pass）
   warp -del && warp -reg                  更换注册
 
 扫描（可选，默认关闭）：
@@ -99,8 +96,9 @@ func usage() {
   承载数据报，因此它们从本机网络栈直接发出，对端看到的是你的真实地址。
   TCP 走隧道，UDP 不走。
 
-  默认监听地址接受来自任何位置的连接，且不要求认证。在不可信网络中请绑定
-  回环地址（-l 127.0.0.1:40000），或设置 -user 与 -pass。
+  默认监听地址（127.0.0.1:40000）只绑回环，不接受公网连接，且不要求认证。
+  对外监听时务必同时给出 -user 与 -pass（或加前置 TLS 反代），否则裸 SOCKS5
+  口在公网明文暴露会被拒绝启动。
 
 `)
 }
@@ -155,7 +153,8 @@ func resolveEdge(spec string) ([]string, error) {
 
 func main() {
 	var (
-		listen = flag.String("l", ":40000", "SOCKS5 监听地址 host:port")
+		// 默认绑回环，避免裸 SOCKS5 口暴露公网（P1-A 裸口收紧）。
+		listen = flag.String("l", "127.0.0.1:40000", "SOCKS5 监听地址 host:port（默认绑回环，对外请配 -user/-pass 或前置 TLS 反代）")
 		user   = flag.String("user", "", "SOCKS5 用户名（与 -pass 同时给出才启用认证）")
 		pass   = flag.String("pass", "", "SOCKS5 密码（与 -user 同时给出才启用认证）")
 		ip     = flag.String("ip", "4", "WARP 边缘：4、6，或显式 host:port")
@@ -303,7 +302,9 @@ func main() {
 		}
 	}
 
-	// Connect to WARP edge via QUIC/H3
+	// Connect to WARP edge via QUIC/H3. proxyClient is held as a tunnel.ProxyClient
+	// so this surface can be a test double for B-1's frontproxy wiring; today the
+	// real *tunnel.MasqueClient satisfies it directly via its HandleSOCKS5.
 	proxyClient, err := tunnel.NewMasqueClient(edgeAddrs, tlsConfig, regData.Token)
 	if err != nil {
 		log.Fatalf("MASQUE 连接失败：%v", err)
@@ -311,12 +312,15 @@ func main() {
 	defer proxyClient.Close()
 	log.Println("✓ MASQUE 连接已建立")
 
-	// Start SOCKS5 proxy server
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatalf("SOCKS5 监听失败：%v", err)
+	// 裸口收紧：-l 默认 127.0.0.1:40000（不上公网）。当 -l 指向非回环且未配
+	// -user/-pass 时，明文 SOCKS5 将对外无认证暴露 —— 拒绝启动而不是带 warning
+	// 默许（warning 易被忽视，裸口一旦公网即不可逆）。
+	var proxy warpserver.ProxyClient = proxyClient
+	if !isLoopbackListen(*listen) && (*user == "" || *pass == "") {
+		log.Fatalf("拒绝启动：-l %q 绑在非回环地址但未配 -user/-pass —— "+
+			"裸 SOCKS5 口将在公网明文暴露。请改用 -l 127.0.0.1:40000（默认），"+
+			"或同时给出 -user/-pass 再对外监听。", *listen)
 	}
-	defer ln.Close()
 
 	socksCfg := tunnel.SOCKS5Config{
 		Username: *user,
@@ -331,54 +335,41 @@ func main() {
 	log.Printf("SOCKS5 代理监听于 %s%s", *listen, authInfo)
 	log.Println("UDP ASSOCIATE 已启用 —— 数据报从本机直接发出，不经过 WARP 隧道")
 
-	// Handle connections
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
+	// SOCKS5 服务由 internal/warpserver.Server 持有（P1-A 抽取）：Listen + Accept
+	// 循环（transient 错指数 backoff 上限 1s 重试、Timeout continue、ErrClosed/ctx
+	// 终止走优雅退出）的逐行等价行为黑盒都搬到了 Server 里，并为 B-1 注入留好
+	// ProxyClient 接口缝。Serve 在收到 SIGINT/SIGTERM 或 parent ctx cancel 时：
+	// cancel ctx + ln.Close 解阻 Accept + 等所有 in-flight HandleSOCKS5 收尾后返回。
 	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		<-sigCh
-		log.Println("正在关闭...")
-		cancel()   // signal all HandleSOCKS5 goroutines to stop
-		ln.Close() // unblock Accept
-	}()
-
-	// Accept errors are not all fatal. Running out of file descriptors or having
-	// a client vanish between the SYN and the accept is transient: backing off
-	// and continuing keeps the proxy alive, where returning would take the whole
-	// process down over a momentary condition.
-	const maxAcceptBackoff = time.Second
-	var acceptBackoff time.Duration
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				break // graceful shutdown
-			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			if errors.Is(err, net.ErrClosed) {
-				break // listener gone and not a shutdown we initiated
-			}
-			if acceptBackoff == 0 {
-				acceptBackoff = 5 * time.Millisecond
-			} else if acceptBackoff *= 2; acceptBackoff > maxAcceptBackoff {
-				acceptBackoff = maxAcceptBackoff
-			}
-			log.Printf("Accept 出错：%v，%s 后重试", err, acceptBackoff)
-			select {
-			case <-time.After(acceptBackoff):
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		acceptBackoff = 0
-		go proxyClient.HandleSOCKS5(ctx, conn, socksCfg)
+	defer cancel()
+	srv := warpserver.New(*listen, proxy, socksCfg, log.Printf)
+	if err := srv.Serve(ctx); err != nil {
+		log.Fatalf("SOCKS5 监听失败：%v", err)
 	}
+}
+
+// isLoopbackListen reports whether a -l value binds only to the loopback. It is
+// the bare-port guard: when -l names a non-loopback address and no auth is set,
+// main refuses to start rather than expose a plaintext SOCKS5 to the public
+// Internet. The check accepts the exact "127.0.0.1:..." / "[::1]:..." forms and
+// the wildcard-bound ":port" / "0.0.0.0:..." forms as non-loopback.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Unparseable -l will be caught by net.Listen later; treat as loopback
+		// here so we do not double-fault the user with a confusing message.
+		return true
+	}
+	if host == "" {
+		return false // ":port" binds all interfaces, includes non-loopback
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A hostname given to -l (e.g. example.com:1080) — resolves to whatever
+		// the resolver says, so treat as public-facing.
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // runEndpointScan 在启动前对 WARP 边缘全段做扫描优选，返回替换后的 edgeAddrs。
