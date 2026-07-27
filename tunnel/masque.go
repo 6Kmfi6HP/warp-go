@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http2"
 )
+
 
 // DoH endpoints, tried in order. These are the addresses warp-svc compiles in as
 // its consumer defaults (a 4-entry IpAddr blob read out of dns_proxy) — not the
@@ -173,6 +175,20 @@ type MasqueClient struct {
 	// singleflight for DNS: coalesce concurrent queries for the same host
 	dnsFlight   map[string]*dnsFlightResult
 	dnsFlightMu sync.Mutex
+
+	// —— 端点轮询（rotate）池化字段。rotateSize==0 时整个池不启用：上面 cur/connMu/
+	// reconnectMu 的单连接退化路径原样工作，下面字段全部不被触及（零代价回退）。
+	//
+	// rotateSize 是池容量（= -scan-top，默认 0 关闭 / 启用时通常 4）。pool 是 N 条独立
+	// QUIC 连接各承一个 bundle；rotateIdx 是 per-request round-robin 的游标；perSlotReconnect
+	// 为每个槽位单独配一把锁，让 reconnectSlot 互不打架（防风暴）。dialFn 仅供注入式测试
+	// 覆盖拨号行为，nil 时走生产 dialAddr——与 socks5 测试同一注入哲学（struct 字段注入，
+	// 不引包级可变 seam，少一个污染点）。
+	rotateSize      int
+	pool            []*connBundle
+	rotateIdx       atomic.Uint64
+	perSlotReconnect []sync.Mutex
+	dialFn          func(ctx context.Context, addr string) (*connBundle, error)
 }
 
 type dnsCacheEntry struct {
@@ -192,7 +208,15 @@ type dnsFlightResult struct {
 // socks5Addr 在非空时启用上游 SOCKS5 出口：去往边缘的 QUIC/UDP 流量先经此代理。
 // 仅作用于正式拨号路径，scanner 不受影响。"socks5://" 前缀在此自动补全，调用方
 // 传裸 host:port 即可。空串 = 直连（原有行为）。
-func NewMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string, socks5Addr string) (*MasqueClient, error) {
+//
+// rotateSize 启用端点轮询池：>1 时建 N 条独立 QUIC 连接（每条绑 edgeAddrs[i%len]，
+// per-request round-robin 选下一条开 H3 流，实现「换端点 → 换出口 IP」）。0 或 <=1
+// 走原有单连接行为（cur 单 bundle）。建池前置：edgeAddrs 至少要有 rotateSize 个不同
+// 端点，否则不建池（不够多端点，轮不出不同 IP）。建池串行（防 socks5 上游并发限），
+// 任一槽失败整池放弃 + warning + 退回单连接路径——与 runEndpointScan「失败回退、不致命」
+// 同语义。空 socks5 下 rotateSize>1 也不建池（直连 anycast 同 colo，轮询无换 IP 收益）；
+// main 层 decideRotate 已在启动期拦这种组合，此处再防一道是纵深防御。
+func NewMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string, socks5Addr string, rotateSize int) (*MasqueClient, error) {
 	if len(edgeAddrs) == 0 {
 		return nil, errors.New("未提供任何边缘地址")
 	}
@@ -242,12 +266,92 @@ func NewMasqueClient(edgeAddrs []string, tlsConfig *tls.Config, token string, so
 		dnsCache:     make(map[string]dnsCacheEntry),
 		dnsFlight:    make(map[string]*dnsFlightResult),
 	}
+
+	// buildPool 在条件满足时建 N 条池连接；返回 nil 表示未建池（调用方走单连接 dial 兜底）。
+	// 建池失败（任一槽拨号错）也回 nil + warning，已建 bundle 全部 close 释放——
+	// 与 runEndpointScan 同语义：失败回退，不致命。
+	if built := c.buildPool(context.Background(), rotateSize); built {
+		// DoH 挂 pool[0] 的 H3 流上（与原单连接挂 cur 同一机制），保留现有 DoH 路径不变。
+		c.cur = c.pool[0]
+		return c, nil
+	}
+
+	// 退化路径：池未启用 / 不够端点 / 建池失败 → 单连接回退。
 	bundle, err := c.dial(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	c.cur = bundle
 	return c, nil
+}
+
+// buildPool 串行建立 rotateSize 条独立 QUIC 连接填池。返回 true 表示池已建好（
+// c.pool/c.rotateSize/perSlotReconnect 已就位、c.cur 已指向 pool[0]）；false 表示未建池，
+// 调用方走单连接回退。建池失败时把已建 bundle 全部 close，避免半成品泄漏。
+//
+// 不建池的条件（任一即返 false，silent 或 warning）：
+//   - rotateSize <= 1：池大小过小，per-request 轮转无意义。
+//   - edgeAddrs 数量 < rotateSize：不够端点填池。
+//   - 唯一 host 数 < rotateSize：建池要「换端点换出口 IP」，edge IP 不分散则轮询无换 IP 收益。
+//     典型触发：-scan 失败回退到注册端点（reg.json 单 host 多 port，见 registration.go:44-49），
+//     此时 edgeAddrs 满足数量但 host 集中在一个 WARP IP——decideRotate 不感知 scan 是否真的成功，
+//     仍返 size=N，main 日志打了「轮询自动启用 池=N」却实际不轮换。此处唯一 host 校验是这条
+//     语义漏检的最后一道闸，warning 提醒用户「池建不起来、回退单连接」与日志自洽。
+//   - socks5 上游未启用（socks5Dialer 为 nil）：直连 anycast 同 colo，轮询无换 IP 收益；
+//     main 层 decideRotate 已拦此组合，此处再防一道是纵深防御。
+//
+// 串行建池（非并发）：socks5 上游并发 TCP 控制连接数常有上限（典型 <10），N=4 串行
+// 安全；并发建池可能撞上游限。建一条失败即整池放弃——避免「半池」难推理状态。
+func (c *MasqueClient) buildPool(ctx context.Context, rotateSize int) bool {
+	if rotateSize <= 1 || len(c.edgeAddrs) < rotateSize || c.socks5Dialer == nil {
+		if rotateSize > 1 && c.socks5Dialer == nil {
+			// 显式开了轮询却没 socks5——理论上 main 已 fatal 拦，此处兜底防逻辑漏。
+			log.Printf("⚠ 轮询未启用：未启用 -socks5，直连下轮询无换 IP 收益")
+		}
+		return false
+	}
+
+	// 唯一 host 计数：edgeAddrs 前 rotateSize 个端点（建池用这部分）的不同 host 数。
+	// 不足则建池没意义（多槽同 IP，不轮换出口 IP）——回退单连接 + warning，与 main 日志自洽。
+	uniqueHosts := make(map[string]struct{}, rotateSize)
+	for i := 0; i < rotateSize; i++ {
+		if host, _, err := net.SplitHostPort(c.edgeAddrs[i]); err == nil {
+			uniqueHosts[host] = struct{}{}
+		} else {
+			// SplitHostPort 失败（地址格式异常）是 buildPool 不应容忍的，记入并跳过此槽计数。
+			// 仍允许后续拨号尝试——若多端点都非法，dialForRotate 会在拨号时返错自然降级。
+			uniqueHosts[c.edgeAddrs[i]] = struct{}{}
+		}
+	}
+	if len(uniqueHosts) < rotateSize {
+		log.Printf("⚠ 端点轮询未启用：前 %d 个端点只有 %d 个唯一 host（多数同 IP，轮询无换 IP 收益）；回退到单连接",
+			rotateSize, len(uniqueHosts))
+		return false
+	}
+
+	pool := make([]*connBundle, rotateSize)
+	for i := 0; i < rotateSize; i++ {
+		// 每槽绑固定端点 edgeAddrs[i]（已保证 len(edgeAddrs) >= rotateSize，不用模）。
+		// 走 dialForRotate 而非直调 dialAddr：让测试可经 dialFn 注入假拨号覆盖建池路径。
+		bundle, err := c.dialForRotate(ctx, c.edgeAddrs[i])
+		if err != nil {
+			// 整池放弃：先 close 已建好的 bundle，避免半成品泄漏。
+			for j := 0; j < i; j++ {
+				if pool[j] != nil {
+					pool[j].close("buildPool failed")
+				}
+			}
+			log.Printf("⚠ 端点轮询建池第 %d 槽（%s）失败：%v；回退到单连接", i, c.edgeAddrs[i], err)
+			return false
+		}
+		pool[i] = bundle
+	}
+
+	c.rotateSize = rotateSize
+	c.pool = pool
+	c.perSlotReconnect = make([]sync.Mutex, rotateSize)
+	log.Printf("✓ 端点轮询已就绪（池大小=%d，端点=%v，per-request round-robin）", rotateSize, c.edgeAddrs[:rotateSize])
+	return true
 }
 
 // dial tries each candidate edge address in turn, starting from the one that
@@ -435,15 +539,21 @@ func (c *MasqueClient) currentConnection() (*connBundle, error) {
 
 // openRequestStream opens an H3 request stream. If the underlying connection is
 // dead or unresponsive, it triggers a single automatic reconnection.
+//
+// 池模式（rotateSize>0）与退化模式（rotateSize==0）的差别仅在此处汇聚：
+//   - pickBundle 返回 (bundle, idx)：idx>=0 走池、idx==-1 走退化（currentConnection 路径）。
+//   - 重连分发：池走 reconnectSlot(idx, stale)（槽位级、不阻塞他槽），退化走 reconnect(stale)
+//     （全局 reconnectMu、byte-for-byte 原行为）。两条路径在 openRequestStream 这里靠 idx
+//     路由，主流程在此之外不变——重试一次策略保留。
 func (c *MasqueClient) openRequestStream(ctx context.Context) (*http3.RequestStream, error) {
-	bundle, err := c.currentConnection()
+	bundle, idx, err := c.pickBundle()
 	if err != nil {
 		// Connection is dead — reconnect immediately.
 		log.Printf("HTTP/3 连接已失效，正在重连 ...")
-		if reconnectErr := c.reconnect(nil); reconnectErr != nil {
+		if reconnectErr := c.reconnectBundle(ctx, idx, nil); reconnectErr != nil {
 			return nil, fmt.Errorf("连接已失效，重连失败：%w", reconnectErr)
 		}
-		bundle, err = c.currentConnection()
+		bundle, idx, err = c.pickBundle()
 		if err != nil {
 			return nil, err
 		}
@@ -467,14 +577,34 @@ func (c *MasqueClient) openRequestStream(ctx context.Context) (*http3.RequestStr
 
 	// Stream open failed (incl. timeout) — reconnect and retry once.
 	log.Printf("HTTP/3 流打开失败（%v），正在重连 ...", err)
-	if reconnectErr := c.reconnect(bundle); reconnectErr != nil {
+	if reconnectErr := c.reconnectBundle(ctx, idx, bundle); reconnectErr != nil {
 		return nil, fmt.Errorf("打开请求流失败：%v；重连失败：%w", err, reconnectErr)
 	}
-	bundle, err = c.currentConnection()
+	bundle, idx, err = c.pickBundle()
 	if err != nil {
 		return nil, err
 	}
 	return bundle.h3Client.OpenRequestStream(ctx)
+}
+
+// reconnectBundle 是 openRequestStream 的重连路由分发：按 idx 选池或退化路径。
+//   - idx >= 0：池模式，走 reconnectSlot(idx, stale)，传与原超时一致的 35s background ctx
+//     （原 reconnect 内部即用 35s），让槽位重连与单连接重连等待时间对齐。
+//   - idx == -1：退化模式，走 reconnect(stale)（全局 reconnectMu + 原 dial-by-addrIdx 序试行为）。
+//
+// 抽此 helper 是为把「路由分发」从 openRequestStream 主流程剥离——两处重连点（死-on-pick
+// 与 stream-open-fail）共用同一路由逻辑，主流程保持清晰。
+func (c *MasqueClient) reconnectBundle(ctx context.Context, idx int, stale *connBundle) error {
+	if idx >= 0 {
+		// 透传调用方 ctx 并叠加 35s 上限：当调用方（如 SOCKS5 HandleSOCKS5 的请求超时）取消
+		// 时，槽位拨号也立即取消、释放 perSlotReconnect[idx] 锁，避免「调用方已放弃、拨号仍在
+		// 背景占锁 35s」的尾部锁占用（被二期 review code 报为 H2）。退化 reconnect 路径维持
+		// 一期 background+35s 行为不动——改它需扩散到原 currentConnection 等调用点，本期范围外。
+		dialCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+		defer cancel()
+		return c.reconnectSlot(dialCtx, idx, stale)
+	}
+	return c.reconnect(stale)
 }
 
 func (c *MasqueClient) reconnect(stale *connBundle) error {
@@ -1384,10 +1514,21 @@ func (c *MasqueClient) Close() error {
 
 		c.connMu.Lock()
 		c.closed = true
-		bundle := c.cur
+		// 池模式遍历全池关闭；退化模式关 c.cur。把待关 bundle 收集后释放锁再 close——
+		// 避免持 connMu 期间 close（close 触发 quicConn.CloseWithError 回调可能逆入锁）。
+		var toClose []*connBundle
+		if c.rotateSize > 0 && len(c.pool) > 0 {
+			toClose = c.pool
+			c.pool = nil
+		} else if c.cur != nil {
+			toClose = []*connBundle{c.cur}
+		}
 		c.cur = nil
 		c.connMu.Unlock()
-		bundle.close("bye")
+
+		for _, b := range toClose {
+			b.close("bye")
+		}
 	})
 	return nil
 }
